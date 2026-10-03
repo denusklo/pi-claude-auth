@@ -3,11 +3,15 @@ import {
     chmodSync,
     existsSync,
     mkdirSync,
+    readdirSync,
     readFileSync,
+    renameSync,
+    rmSync,
     writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
+import { lockSync } from "proper-lockfile"
 import {
     readAllClaudeAccounts,
     refreshAccount,
@@ -88,45 +92,153 @@ export function saveAccountSource(source: string): void {
     }
 }
 
-function syncToPath(authPath: string, creds: ClaudeCredentials): void {
-    let auth: Record<string, unknown> = {}
-    if (existsSync(authPath)) {
-        const raw = readFileSync(authPath, "utf-8").trim()
-        if (raw) {
-            try {
-                auth = JSON.parse(raw)
-            } catch {
-                // Malformed file, start fresh
+// pi serializes every auth.json write behind a proper-lockfile lock on the
+// same path. The sync has to take the same lock, or its read-modify-write can
+// interleave with a pi write (a login completed by another pi process) and
+// silently drop a provider credential pi just stored.
+const AUTH_LOCK_ATTEMPTS = 10
+const AUTH_LOCK_RETRY_SPIN_MS = 20
+
+function acquireAuthLockSync(authPath: string): () => void {
+    for (let attempt = 1; attempt <= AUTH_LOCK_ATTEMPTS; attempt++) {
+        try {
+            return lockSync(authPath, { realpath: false })
+        } catch (err) {
+            const code = (err as NodeJS.ErrnoException | null)?.code
+            if (code !== "ELOCKED" || attempt === AUTH_LOCK_ATTEMPTS) throw err
+            const deadline = Date.now() + AUTH_LOCK_RETRY_SPIN_MS
+            while (Date.now() < deadline) {
+                /* brief spin between attempts, mirroring pi's retry loop */
             }
         }
     }
-    // pi persists OAuth credentials as `{ type: "oauth", access, refresh,
-    // expires }` keyed by provider id. Seeding the `anthropic` entry lets pi
-    // use the Claude Code credentials with no separate /login.
-    auth.anthropic = {
-        type: "oauth",
-        access: creds.accessToken,
-        refresh: creds.refreshToken,
-        expires: creds.expiresAt,
+    throw new Error(`Could not acquire lock on ${authPath}`)
+}
+
+function parseAuthJson(raw: string): Record<string, unknown> | null {
+    // Strip a UTF-8 BOM the same way pi does, so a BOM-prefixed but otherwise
+    // valid auth.json is merged instead of treated as corrupt.
+    const trimmed = raw.replace(/^\uFEFF/, "").trim()
+    if (!trimmed) return {}
+    try {
+        const parsed: unknown = JSON.parse(trimmed)
+        if (
+            typeof parsed === "object" &&
+            parsed !== null &&
+            !Array.isArray(parsed)
+        ) {
+            return parsed as Record<string, unknown>
+        }
+    } catch {
+        // fall through to the malformed case
     }
+    return null
+}
+
+// Keep at most this many `auth.json.corrupt-*` backups so a persistently
+// corrupt file cannot accumulate an unbounded pile of credential-bearing
+// copies.
+const CORRUPT_BACKUP_LIMIT = 10
+
+function writeCorruptBackup(
+    dir: string,
+    authPath: string,
+    raw: string,
+): string {
+    const prefix = `${basename(authPath)}.corrupt-`
+    // Reuse an existing backup with identical content instead of writing a
+    // new one on every sync while the file stays corrupt.
+    const existing = readdirSync(dir)
+        .filter((name) => name.startsWith(prefix))
+        .sort()
+    for (const name of existing) {
+        try {
+            if (readFileSync(join(dir, name), "utf-8") === raw) {
+                return join(dir, name)
+            }
+        } catch {
+            // unreadable backup, ignore it
+        }
+    }
+    while (existing.length >= CORRUPT_BACKUP_LIMIT) {
+        rmSync(join(dir, existing.shift() as string), { force: true })
+    }
+    const backup = join(
+        dir,
+        `${prefix}${new Date().toISOString().replace(/[:.]/g, "-")}`,
+    )
+    writeFileSync(backup, raw, { encoding: "utf-8", mode: 0o600 })
+    return backup
+}
+
+function syncToPath(authPath: string, creds: ClaudeCredentials): boolean {
     const dir = dirname(authPath)
     if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true, mode: 0o700 })
     }
-    writeFileSync(authPath, JSON.stringify(auth, null, 2), {
-        encoding: "utf-8",
-        mode: 0o600,
-    })
-    if (process.platform !== "win32") {
-        chmodSync(authPath, 0o600)
+    if (!existsSync(authPath)) {
+        writeFileSync(authPath, "{}", { encoding: "utf-8", mode: 0o600 })
+    }
+
+    const release = acquireAuthLockSync(authPath)
+    try {
+        const raw = readFileSync(authPath, "utf-8")
+        const auth = parseAuthJson(raw)
+        if (auth === null) {
+            // Never replace a malformed auth.json wholesale: the old code
+            // reset it to `{}` + `anthropic`, wiping every other provider's
+            // credentials. Keep the corrupt bytes in a sibling backup and
+            // skip this sync instead.
+            const backup = writeCorruptBackup(dir, authPath, raw)
+            log("sync_auth_json_corrupt", { path: authPath, backup })
+            return false
+        }
+        // pi persists OAuth credentials as `{ type: "oauth", access, refresh,
+        // expires }` keyed by provider id. Seeding the `anthropic` entry lets
+        // pi use the Claude Code credentials with no separate /login.
+        auth.anthropic = {
+            type: "oauth",
+            access: creds.accessToken,
+            refresh: creds.refreshToken,
+            expires: creds.expiresAt,
+        }
+        // Atomic write (temp file + rename) while holding the lock, so a
+        // crash can never leave a partially-written auth.json behind.
+        const tmpPath = join(dir, `.auth.json.tmp-${process.pid}-${Date.now()}`)
+        writeFileSync(tmpPath, JSON.stringify(auth, null, 2), {
+            encoding: "utf-8",
+            mode: 0o600,
+        })
+        try {
+            renameSync(tmpPath, authPath)
+        } catch (err) {
+            // Best-effort cleanup that must not mask the original error.
+            try {
+                rmSync(tmpPath, { force: true })
+            } catch {
+                // ignore
+            }
+            throw err
+        }
+        if (process.platform !== "win32") {
+            chmodSync(authPath, 0o600)
+        }
+        return true
+    } finally {
+        try {
+            release()
+        } catch {
+            // The lock can already be gone (stale takeover by another
+            // process); the write above already succeeded or failed.
+        }
     }
 }
 
 export function syncAuthJson(creds: ClaudeCredentials): void {
     const authPath = getAuthJsonPath()
     try {
-        syncToPath(authPath, creds)
-        log("sync_auth_json", { path: authPath, success: true })
+        const written = syncToPath(authPath, creds)
+        log("sync_auth_json", { path: authPath, success: written })
     } catch (err) {
         log("sync_auth_json", {
             path: authPath,

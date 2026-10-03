@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `auth.json` sync now takes the same `proper-lockfile` lock pi itself uses
+  for that file, so a background sync can no longer interleave with a pi
+  credential write (for example a `/login` completed by another pi process)
+  and silently drop a provider credential pi just stored.
+- A malformed `auth.json` is now preserved in an `auth.json.corrupt-*`
+  sibling backup and left untouched instead of being reset to `{}` +
+  `anthropic`, which wiped every other provider's credentials.
+- `auth.json` writes are now atomic (temp file + rename), so a crash can no
+  longer leave a partially-written file behind.
+
 # [0.1.0](https://github.com/pankajudhas81/pi-claude-auth/compare/v0.0.1...v0.1.0) (2026-05-30)
 
 ## 0.0.1
