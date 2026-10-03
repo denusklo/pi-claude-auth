@@ -1,11 +1,15 @@
 import assert from "node:assert/strict"
-import {
+import { spawn } from "node:child_process"
+import { once } from "node:events"
+import fs, {
+    existsSync,
     mkdtempSync,
     readdirSync,
     readFileSync,
     rmSync,
     writeFileSync,
 } from "node:fs"
+import { syncBuiltinESMExports } from "node:module"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, test } from "node:test"
@@ -129,7 +133,7 @@ test("syncAuthJson: never wipes a malformed auth.json, keeps a backup instead", 
     assert.equal(readFileSync(join(dir, backups[0]), "utf-8"), corrupt)
 })
 
-test("syncAuthJson: does not write while another process holds the auth.json lock", () => {
+test("syncAuthJson: does not write while another holder has the auth.json lock", () => {
     const authPath = join(dir, "auth.json")
     writeFileSync(
         authPath,
@@ -196,6 +200,158 @@ test("syncAuthJson: does not pile up identical corrupt backups", () => {
         1,
     )
 })
+
+for (const raw of ["", " \n\t", "\uFEFF  ", "[]", "null", "42", '"text"']) {
+    test(`syncAuthJson: preserves invalid content ${JSON.stringify(raw)}`, () => {
+        const authPath = join(dir, "auth.json")
+        writeFileSync(authPath, raw)
+        syncAuthJson({ accessToken: "a", refreshToken: "r", expiresAt: 1 })
+        assert.equal(readFileSync(authPath, "utf-8"), raw)
+        assert.equal(existsSync(`${authPath}.lock`), false)
+        const backups = readdirSync(dir).filter((name) =>
+            name.startsWith("auth.json.corrupt-"),
+        )
+        assert.equal(backups.length, 1)
+        assert.equal(readFileSync(join(dir, backups[0]), "utf-8"), raw)
+    })
+}
+
+for (const state of ["missing", "truncated"]) {
+    test(
+        `syncAuthJson: interoperates with a separate proper-lockfile writer, ${state}`,
+        { timeout: 10_000 },
+        async () => {
+            const authPath = join(dir, "auth.json")
+            // IPC holds the writer inside its critical section until contention
+            // has been checked. No scheduler timing or real credentials involved.
+            const child = spawn(
+                process.execPath,
+                [
+                    "--input-type=module",
+                    "-e",
+                    `
+            import { writeFileSync } from 'node:fs';
+            import { lockSync } from 'proper-lockfile';
+            const path = process.env.PI_CODING_AGENT_DIR + '/auth.json';
+            const release = lockSync(path, { realpath: false });
+            if (${JSON.stringify(state)} === 'truncated') writeFileSync(path, '');
+            const watchdog = setTimeout(() => process.exit(2), 5000);
+            process.on('message', () => {
+                writeFileSync(path, JSON.stringify({ openai: { type: 'api_key', key: 'synthetic-child-key' } }));
+                release();
+                clearTimeout(watchdog);
+                process.disconnect();
+            });
+            process.send('locked');
+        `,
+                ],
+                {
+                    cwd: new URL("..", import.meta.url),
+                    env: { ...process.env, PI_CODING_AGENT_DIR: dir },
+                    stdio: ["ignore", "ignore", "inherit", "ipc"],
+                },
+            )
+            const exited = once(child, "exit")
+            try {
+                const ready = await Promise.race([
+                    once(child, "message", {
+                        signal: AbortSignal.timeout(5_000),
+                    }),
+                    exited.then(() => {
+                        throw new Error("Writer exited before readiness")
+                    }),
+                ])
+                assert.equal(ready[0], "locked")
+                assert.throws(
+                    () =>
+                        syncAuthJson({
+                            accessToken: "a",
+                            refreshToken: "r",
+                            expiresAt: 1,
+                        }),
+                    { code: "ELOCKED" },
+                )
+                if (state === "missing")
+                    assert.equal(existsSync(authPath), false)
+                else assert.equal(readFileSync(authPath, "utf-8"), "")
+                assert.deepEqual(
+                    readdirSync(dir).sort(),
+                    state === "missing"
+                        ? ["auth.json.lock"]
+                        : ["auth.json", "auth.json.lock"],
+                )
+                child.send("commit")
+                assert.deepEqual(await exited, [0, null])
+                syncAuthJson({
+                    accessToken: "a",
+                    refreshToken: "r",
+                    expiresAt: 1,
+                })
+                assert.deepEqual(JSON.parse(readFileSync(authPath, "utf-8")), {
+                    openai: { type: "api_key", key: "synthetic-child-key" },
+                    anthropic: {
+                        type: "oauth",
+                        access: "a",
+                        refresh: "r",
+                        expires: 1,
+                    },
+                })
+                assert.deepEqual(readdirSync(dir), ["auth.json"])
+            } finally {
+                if (child.exitCode === null && child.signalCode === null)
+                    child.kill("SIGKILL")
+                await exited
+            }
+        },
+    )
+}
+
+for (const failure of ["read", "write", "rename"]) {
+    test(`syncAuthJson: preserves original and cleans up after ${failure} failure`, (t) => {
+        const authPath = join(dir, "auth.json")
+        const original = '{"openai":{"key":"synthetic-original"}}'
+        writeFileSync(authPath, original)
+        const error = Object.assign(new Error(`injected ${failure} failure`), {
+            code: "EIO",
+        })
+        const realWrite = fs.writeFileSync
+        // Fault injection is needed to reproduce partial writes portably.
+        if (failure === "write") {
+            t.mock.method(fs, "writeFileSync", (path, data, options) => {
+                realWrite(path, data, options)
+                throw error
+            })
+        } else if (failure === "rename") {
+            t.mock.method(fs, "renameSync", () => {
+                throw error
+            })
+        } else {
+            t.mock.method(fs, "readFileSync", () => {
+                throw error
+            })
+        }
+        syncBuiltinESMExports()
+        try {
+            assert.throws(
+                () =>
+                    syncAuthJson({
+                        accessToken: "a",
+                        refreshToken: "r",
+                        expiresAt: 1,
+                    }),
+                (err) => err === error,
+            )
+        } finally {
+            t.mock.restoreAll()
+            syncBuiltinESMExports()
+        }
+        assert.equal(readFileSync(authPath, "utf-8"), original)
+        assert.deepEqual(readdirSync(dir), ["auth.json"])
+        // A subsequent write proves the error path released the lock.
+        syncAuthJson({ accessToken: "a", refreshToken: "r", expiresAt: 1 })
+        assert.deepEqual(readdirSync(dir), ["auth.json"])
+    })
+}
 
 test("account source persistence round-trips", () => {
     assert.equal(loadPersistedAccountSource(), null)

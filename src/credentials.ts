@@ -3,6 +3,7 @@ import {
     chmodSync,
     existsSync,
     mkdirSync,
+    mkdtempSync,
     readdirSync,
     readFileSync,
     renameSync,
@@ -119,7 +120,7 @@ function parseAuthJson(raw: string): Record<string, unknown> | null {
     // Strip a UTF-8 BOM the same way pi does, so a BOM-prefixed but otherwise
     // valid auth.json is merged instead of treated as corrupt.
     const trimmed = raw.replace(/^\uFEFF/, "").trim()
-    if (!trimmed) return {}
+    if (!trimmed) return null
     try {
         const parsed: unknown = JSON.parse(trimmed)
         if (
@@ -176,13 +177,23 @@ function syncToPath(authPath: string, creds: ClaudeCredentials): boolean {
     if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true, mode: 0o700 })
     }
-    if (!existsSync(authPath)) {
-        writeFileSync(authPath, "{}", { encoding: "utf-8", mode: 0o600 })
-    }
-
     const release = acquireAuthLockSync(authPath)
     try {
-        const raw = readFileSync(authPath, "utf-8")
+        // Only absence observed under the lock permits initialization. Never
+        // create a placeholder before locking: it could truncate a pi write.
+        let raw = "{}"
+        try {
+            raw = readFileSync(authPath, "utf-8")
+        } catch (err) {
+            if (
+                typeof err !== "object" ||
+                err === null ||
+                !("code" in err) ||
+                err.code !== "ENOENT"
+            ) {
+                throw err
+            }
+        }
         const auth = parseAuthJson(raw)
         if (auth === null) {
             // Never replace a malformed auth.json wholesale: the old code
@@ -202,23 +213,24 @@ function syncToPath(authPath: string, creds: ClaudeCredentials): boolean {
             refresh: creds.refreshToken,
             expires: creds.expiresAt,
         }
-        // Atomic write (temp file + rename) while holding the lock, so a
-        // crash can never leave a partially-written auth.json behind.
-        const tmpPath = join(dir, `.auth.json.tmp-${process.pid}-${Date.now()}`)
-        writeFileSync(tmpPath, JSON.stringify(auth, null, 2), {
-            encoding: "utf-8",
-            mode: 0o600,
-        })
+        // A unique private sibling directory keeps the temp file on the same
+        // filesystem and prevents collisions. Clean up even a partial write.
+        const tmpDir = mkdtempSync(join(dir, ".auth.json.tmp-"))
+        const tmpPath = join(tmpDir, "auth.json")
         try {
+            writeFileSync(tmpPath, JSON.stringify(auth, null, 2), {
+                encoding: "utf-8",
+                mode: 0o600,
+                flag: "wx",
+            })
             renameSync(tmpPath, authPath)
-        } catch (err) {
+        } finally {
             // Best-effort cleanup that must not mask the original error.
             try {
-                rmSync(tmpPath, { force: true })
+                rmSync(tmpDir, { recursive: true, force: true })
             } catch {
                 // ignore
             }
-            throw err
         }
         if (process.platform !== "win32") {
             chmodSync(authPath, 0o600)
